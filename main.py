@@ -504,6 +504,7 @@ class JarvisLive:
         self._dashboard     = None
         self._briefing_sent = False          # morning briefing fires once per process
         self._sys_monitor   = SystemMonitor()  # persistent cooldown state
+        self.speaker_mode   = True
 
     def _make_remote_key(self):
         """Called from Qt main thread when user presses Remote Control."""
@@ -730,16 +731,19 @@ class JarvisLive:
     async def _send_realtime(self):
         while True:
             msg = await self.out_queue.get()
-            await self.session.send_realtime_input(media=msg)
+            await self.session.send_realtime_input(audio=msg)
 
     async def _listen_audio(self):
         print("[JARVIS] 🎤 Mic started")
         loop = asyncio.get_event_loop()
 
         def callback(indata, frames, time_info, status):
-            with self._speaking_lock:
-                jarvis_speaking = self._is_speaking
-            if not jarvis_speaking and not self.ui.muted and not self._phone_active:
+            if getattr(self, "speaker_mode", True):
+                with self._speaking_lock:
+                    if self._is_speaking:
+                        return
+
+            if not self.ui.muted and not self._phone_active:
                 data = indata.tobytes()
                 loop.call_soon_threadsafe(
                     self.out_queue.put_nowait,
@@ -769,7 +773,22 @@ class JarvisLive:
             while True:
                 async for response in self.session.receive():
 
-                    if response.data:
+                    is_interrupted = (
+                        response.server_content
+                        and response.server_content.interrupted
+                    )
+
+                    if is_interrupted:
+                        print("[JARVIS] 🛑 Interrupted by user!")
+                        self.set_speaking(False)
+                        while not self.audio_in_queue.empty():
+                            try:
+                                self.audio_in_queue.get_nowait()
+                            except asyncio.QueueEmpty:
+                                break
+                        out_buf = []
+
+                    if response.data and not is_interrupted:
                         if self._turn_done_event and self._turn_done_event.is_set():
                             self._turn_done_event.clear()
                         self.audio_in_queue.put_nowait(response.data)
@@ -864,13 +883,14 @@ class JarvisLive:
             stream.stop()
             stream.close()
 
-    # ── Morning briefing ────────────────────────────────────────────────────────
+    # ── Startup greeting ────────────────────────────────────────────────────────
 
     async def _send_startup_briefing(self) -> None:
         """
-        Two-phase briefing for instant perceived response:
-          Phase 1 — immediate greeting (no tools, no fetch) → Jarvis speaks in <2s
-          Phase 2 — news fetched in background, injected after greeting finishes
+        Briefing greeting on startup:
+          - Greets the user and states the current time.
+          - Informs the user that JARVIS is fully operational.
+          - Lists the key tasks that can be performed.
         """
         await asyncio.sleep(0.3)
         if not self.session:
@@ -888,109 +908,27 @@ class JarvisLive:
         name = _val("name")
 
         from datetime import datetime
-        time_str = datetime.now().strftime("%H:%M")
+        time_str = datetime.now().strftime("%I:%M %p")
 
-        # ── Phase 1: instant greeting — zero data needed ──────────────────────
-        p1_lines = [
-            "[STARTUP_GREETING] Greet the user immediately. Keep it to 1-2 short sentences.",
+        greeting_lines = [
+            "[STARTUP_GREETING] Greet the user naturally. Keep it concise (2-3 sentences).",
             f"Current time: {time_str}.",
-            "- Say hello and mention the time naturally.",
-            "- Say you are checking today's headlines and will share them in a moment.",
-            "- Do NOT call any tools. Do NOT say [STARTUP_GREETING].",
+            "- Say hello and mention the current time.",
+            "- State that you are fully operational and ready to assist.",
+            "- Tell the user they can ask you to do tasks such as: search the web, manage files, write and run code, adjust computer settings (like volume or brightness), find flights, or process images and videos.",
+            "- Do NOT call any tools. Do NOT talk about checking the news.",
+            "- Do NOT say [STARTUP_GREETING].",
             "- Respond in "
             + (f"language: {lang}." if lang else "the user's language (default: English)."),
         ]
         if name:
-            p1_lines.append(f"- Address the user as {name}.")
+            greeting_lines.append(f"- Address the user as {name}.")
 
         await self.session.send_client_content(
-            turns={"parts": [{"text": '\n'.join(p1_lines)}]},
+            turns={"parts": [{"text": '\n'.join(greeting_lines)}]},
             turn_complete=True,
         )
-        self.ui.write_log("SYS: Briefing phase 1 (greeting) sent.")
-
-        # ── Phase 2: fetch news in background, deliver after greeting plays ───
-        async def _guarded_news():
-            try:
-                await self._briefing_news_phase(lang)
-            except Exception as e:
-                print(f"[Briefing] Phase 2 error: {e}")
-                self.ui.write_log(f"SYS: Briefing news phase failed: {e}")
-        asyncio.create_task(_guarded_news())
-
-    async def _briefing_news_phase(self, lang: str) -> None:
-        """
-        Fetches headlines (DDG → Gemini fallback), shows them on screen,
-        then injects a short 2-headline summary into the Live session.
-        Waits enough time for the phase-1 greeting to finish playing first.
-        """
-        from actions.web_search import _ddg_search, _gemini_headlines
-
-        fetch_start           = asyncio.get_event_loop().time()
-        headlines: list[str]  = []
-        full_news             = ""
-
-        # 1) DDG — ~0.6 s when available
-        try:
-            results = await asyncio.wait_for(
-                asyncio.to_thread(_ddg_search, "world news today", 6),
-                timeout=4.0,
-            )
-            if results:
-                headlines = [r["title"] for r in results if r.get("title")][:6]
-                full_news = "\n\n".join(
-                    f"• {r.get('title','')}\n  {r.get('snippet','')}\n  {r.get('url','')}"
-                    for r in results
-                )
-        except Exception as e:
-            print(f"[Briefing] DDG: {e}")
-
-        # 2) Gemini grounded search — reliable fallback
-        if not headlines:
-            try:
-                headlines, full_news = await asyncio.wait_for(
-                    asyncio.to_thread(_gemini_headlines, 5),
-                    timeout=8.0,
-                )
-            except Exception as e:
-                print(f"[Briefing] Gemini headlines: {e}")
-
-        # Show full list on screen immediately when data arrives
-        if full_news:
-            self.ui.show_content("NEWS — latest headlines", full_news)
-
-        if not headlines or not self.session:
-            return
-
-        # Ensure the phase-1 greeting (≈ 3 s of speech) has finished before we speak again
-        elapsed       = asyncio.get_event_loop().time() - fetch_start
-        wait_more     = max(0.0, 3.5 - elapsed)
-        if wait_more > 0:
-            await asyncio.sleep(wait_more)
-
-        if not self.session:
-            return
-
-        headlines_text = "\n".join(f"{i+1}. {h}" for i, h in enumerate(headlines))
-        p2_lines = [
-            "[BRIEFING_NEWS] Today's headlines are already displayed on screen.",
-            "Data:",
-            headlines_text,
-            "",
-            "Voice rules:",
-            "- Mention ONLY 2 headlines — one short sentence each.",
-            "- Tell the user the full list is visible on screen.",
-            "- Ask if they need anything.",
-            "- Do NOT say [BRIEFING_NEWS].",
-            "- Respond in "
-            + (f"language: {lang}." if lang else "the user's language."),
-        ]
-
-        await self.session.send_client_content(
-            turns={"parts": [{"text": '\n'.join(p2_lines)}]},
-            turn_complete=True,
-        )
-        self.ui.write_log("SYS: Briefing phase 2 (news) sent.")
+        self.ui.write_log("SYS: Startup greeting sent.")
 
     # ── System monitor ──────────────────────────────────────────────────────────
 
@@ -1086,6 +1024,12 @@ class JarvisLive:
 
         while True:
             try:
+                try:
+                    with open(API_CONFIG_PATH, "r", encoding="utf-8") as f:
+                        self.speaker_mode = json.load(f).get("speaker_mode", True)
+                except Exception:
+                    self.speaker_mode = True
+
                 print("[JARVIS] Connecting...")
                 self.ui.set_state("THINKING")
                 config = self._build_config()
